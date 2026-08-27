@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"maglev.onebusaway.org/internal/clock"
 	"maglev.onebusaway.org/internal/models"
 )
@@ -85,7 +86,9 @@ func TestCurrentTimeHandler_DeterministicTime(t *testing.T) {
 	entry := responseData["entry"].(map[string]any)
 	assert.Equal(t, float64(expectedMs), entry["time"], "Entry time should equal mock clock time")
 
-	// Readable time should match
-	expectedReadable := fixedTime.Format(time.RFC3339)
-	assert.Equal(t, expectedReadable, entry["readableTime"], "Readable time should match mock clock")
+	// readableTime must be formatted in the agency's local timezone (America/Los_Angeles).
+	agencyLoc, err := time.LoadLocation("America/Los_Angeles")
+	require.NoError(t, err)
+	expectedReadable := fixedTime.In(agencyLoc).Format(time.RFC3339)
+	assert.Equal(t, expectedReadable, entry["readableTime"], "readableTime should use agency timezone")
 }
