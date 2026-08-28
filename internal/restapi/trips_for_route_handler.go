@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -72,12 +73,6 @@ func (api *RestAPI) tripsForRouteHandler(w http.ResponseWriter, r *http.Request)
 	// Check the previous day's service for trips running past midnight.
 	// GTFS allows departure times > 24:00:00 (e.g., 25:30:00 = 1:30 AM next day).
 	// These trips belong to yesterday's service but are still active now.
-	// TODO: We should add config for runningLateWindow and runningEarlyWindow like Java OBA
-	// source:https://groups.google.com/g/onebusaway-developers/c/j-G-1UyfbXI/m/J-Su3BArKW0J
-	const (
-		runningLate  = 30 * time.Minute // runningLateWindow
-		runningEarly = 10 * time.Minute // runningEarlyWindow
-	)
 	prevDay := currentTime.AddDate(0, 0, -1)
 	prevFormattedDate := prevDay.Format("20060102")
 	prevServiceIDs, err := api.GtfsManager.GtfsDB.Queries.GetActiveServiceIDsForDate(ctx, prevFormattedDate)
@@ -320,8 +315,63 @@ func (api *RestAPI) tripsForRouteHandler(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	todayMidnight := time.Date(currentTime.Year(), currentTime.Month(), currentTime.Day(), 0, 0, 0, 0, currentLocation)
+	// Interlined blocks can span agencies; fetch each agency's timezone so
+	// entries compute their service day in the right location.
+	agencyLocations := map[string]*time.Location{currentAgency.ID: currentLocation}
+	if len(tripAgencyMap) > 0 {
+		agencyIDSet := make(map[string]struct{}, len(tripAgencyMap))
+		for _, aID := range tripAgencyMap {
+			agencyIDSet[aID] = struct{}{}
+		}
+		delete(agencyIDSet, currentAgency.ID)
+		agencyIDs := make([]string, 0, len(agencyIDSet))
+		for id := range agencyIDSet {
+			agencyIDs = append(agencyIDs, id)
+		}
+		if len(agencyIDs) > 0 {
+			agencies, err := api.GtfsManager.GtfsDB.Queries.GetAgenciesByIDs(ctx, agencyIDs)
+			if err != nil {
+				api.serverErrorResponse(w, r, err)
+				return
+			}
+			for _, a := range agencies {
+				loc, err := loadAgencyLocation(a.ID, a.Timezone)
+				if err != nil {
+					api.Logger.Warn("trips-for-route: invalid agency timezone", "agency_id", a.ID, "error", err)
+					continue
+				}
+				agencyLocations[a.ID] = loc
+			}
+		}
+	}
+
+	serviceDatesByAgency := make(map[string]*serviceDateResolver, len(agencyLocations))
+	for agencyID, loc := range agencyLocations {
+		queryDayMidnight := serviceDateMidnight(currentTime, loc)
+		days, err := api.serviceIDsForDays(ctx, queryDayMidnight)
+		if err != nil {
+			api.serverErrorResponse(w, r, err)
+			return
+		}
+		serviceDatesByAgency[agencyID] = newServiceDateResolverFor(queryDayMidnight, currentTime.In(loc), days)
+	}
 	stopIDsMap := make(map[string]string)
+
+	// Batch-fetch frequencies; success seeds nil to skip fallback queries.
+	// Post-batch trips (interlined, DUPLICATED) fall back per-trip.
+	freqMap := make(map[string][]gtfsdb.Frequency)
+	if len(fetchedTrips) > 0 {
+		tripIDsForFreq := make([]string, 0, len(fetchedTrips))
+		for _, trip := range fetchedTrips {
+			tripIDsForFreq = append(tripIDsForFreq, trip.ID)
+		}
+		var freqErr error
+		freqMap, freqErr = api.fetchFrequenciesForTrips(ctx, tripIDsForFreq)
+		if freqErr != nil {
+			api.serverErrorResponse(w, r, freqErr)
+			return
+		}
+	}
 
 	blockTripForRoute, err := api.buildBlockTripForRoute(ctx, fetchedTrips, routeID, serviceIDs, prevServiceIDs)
 	if err != nil {
@@ -388,10 +438,31 @@ func (api *RestAPI) tripsForRouteHandler(w http.ResponseWriter, r *http.Request)
 		// trip. Per spec, schedule.stopTimes is "scheduled stop times for this
 		// trip" and schedule.previousTripId is "the preceding trip in this
 		// vehicle's block" — both relative to the entry's trip identity.
+		activeResolver, ok := serviceDatesByAgency[activeAgencyID]
+		if !ok {
+			api.Logger.Warn("trips-for-route: missing service date resolver for active agency", "agency_id", activeAgencyID)
+			continue
+		}
+		activeMidnight := activeResolver.Resolve(fetchedTrip)
+
+		entryLocation := currentLocation
+		if loc, ok := agencyLocations[entryAgencyID]; ok {
+			entryLocation = loc
+		}
+		entryMidnight := serviceDateMidnight(currentTime, entryLocation)
+		if entryTrip, ok := tripsByID[entryTripID]; ok {
+			entryResolver, ok := serviceDatesByAgency[entryAgencyID]
+			if !ok {
+				api.Logger.Warn("trips-for-route: missing service date resolver for entry agency", "agency_id", entryAgencyID)
+				continue
+			}
+			entryMidnight = entryResolver.Resolve(entryTrip)
+		}
+
 		var schedule *models.TripsSchedule
 		if includeSchedule {
 			var schedErr error
-			schedule, schedErr = api.buildScheduleForTrip(ctx, entryTripID, entryAgencyID, currentTime, currentLocation)
+			schedule, schedErr = api.buildScheduleForTrip(ctx, entryTripID, entryAgencyID, entryMidnight, entryLocation, freqMap)
 			if schedErr != nil {
 				api.serverErrorResponse(w, r, schedErr)
 				return
@@ -405,18 +476,24 @@ func (api *RestAPI) tripsForRouteHandler(w http.ResponseWriter, r *http.Request)
 		var status *models.TripStatus
 		if includeStatus {
 			var statusErr error
-			status, _, statusErr = api.BuildTripStatus(ctx, activeAgencyID, tripID, nil, todayMidnight, currentTime)
+			status, _, statusErr = api.BuildTripStatus(ctx, activeAgencyID, tripID, nil, activeMidnight, currentTime, freqMap)
 			if statusErr != nil {
 				api.Logger.Warn("BuildTripStatus failed", "trip_id", tripID, "error", statusErr)
 				status = nil
 			}
 		}
 
+		frequency, freqErr := api.frequencyForEntry(ctx, freqMap, entryTripID, entryMidnight, currentTime)
+		if freqErr != nil {
+			api.serverErrorResponse(w, r, freqErr)
+			return
+		}
+
 		entry := models.TripsForRouteListEntry{
-			Frequency:    nil,
+			Frequency:    frequency,
 			Schedule:     schedule,
 			Status:       status,
-			ServiceDate:  todayMidnight.UnixMilli(),
+			ServiceDate:  entryMidnight.UnixMilli(),
 			SituationIds: situations.addRefs(api.tripSituationRefs(ctx, entryTripID, tripsByID, routeAgencyMap)),
 			TripId:       utils.FormCombinedID(entryAgencyID, entryTripID),
 		}
@@ -440,27 +517,14 @@ func (api *RestAPI) tripsForRouteHandler(w http.ResponseWriter, r *http.Request)
 		}
 		dupTripID := vehicle.Trip.ID.ID
 
-		// Resolve the base trip ID for DB lookups.
-		// Try the full ID first; if not found, strip a trailing numeric suffix
-		// (e.g., ".00060") that some feeds append to distinguish duplicated runs.
-		baseTripID := dupTripID
-		baseTrip, baseTripErr := api.GtfsManager.GtfsDB.Queries.GetTrip(ctx, dupTripID)
-		if baseTripErr != nil {
-			if !errors.Is(baseTripErr, sql.ErrNoRows) {
-				api.Logger.Warn("trips-for-route: failed to resolve DUPLICATED trip ID",
-					"dup_trip_id", dupTripID, "error", baseTripErr)
-			}
-			stripped := stripNumericSuffix(dupTripID)
-			if stripped != dupTripID {
-				baseTripID = stripped
-				baseTrip, baseTripErr = api.GtfsManager.GtfsDB.Queries.GetTrip(ctx, baseTripID)
-			}
-		}
+		baseTripID, baseTrip := api.resolveDuplicatedBaseTrip(ctx, dupTripID)
+		// A DUPLICATED trip with no static counterpart leaves baseTrip zeroed,
+		// which the resolver reports as the query day.
 
 		// Index the base trip before the situation lookup below: an unindexed
 		// trip sends tripSituationRefs back to the database for the record
 		// already in hand, the same reuse the interlined path above relies on.
-		if baseTripErr == nil {
+		if baseTrip.ID != "" {
 			tripsByID[baseTrip.ID] = baseTrip
 			if !filteredRouteTrips[baseTripID] {
 				fetchedTrips = append(fetchedTrips, baseTrip)
@@ -468,10 +532,19 @@ func (api *RestAPI) tripsForRouteHandler(w http.ResponseWriter, r *http.Request)
 			}
 		}
 
+		dupLocation := currentLocation
+		if loc, ok := agencyLocations[agencyID]; ok {
+			dupLocation = loc
+		}
+		dupMidnight := serviceDateMidnight(currentTime, dupLocation)
+		if resolver, ok := serviceDatesByAgency[agencyID]; ok {
+			dupMidnight = resolver.Resolve(baseTrip)
+		}
+
 		var schedule *models.TripsSchedule
 		if includeSchedule {
 			var schedErr error
-			schedule, schedErr = api.buildScheduleForTrip(ctx, baseTripID, agencyID, currentTime, currentLocation)
+			schedule, schedErr = api.buildScheduleForTrip(ctx, baseTripID, agencyID, dupMidnight, dupLocation, freqMap)
 			if schedErr != nil {
 				api.serverErrorResponse(w, r, schedErr)
 				return
@@ -482,18 +555,24 @@ func (api *RestAPI) tripsForRouteHandler(w http.ResponseWriter, r *http.Request)
 		var status *models.TripStatus
 		if includeStatus {
 			var statusErr error
-			status, _, statusErr = api.BuildTripStatus(ctx, agencyID, baseTripID, &vehicle, todayMidnight, currentTime)
+			status, _, statusErr = api.BuildTripStatus(ctx, agencyID, baseTripID, &vehicle, dupMidnight, currentTime, freqMap)
 			if statusErr != nil {
 				api.Logger.Warn("BuildTripStatus failed for DUPLICATED trip", "trip_id", baseTripID, "error", statusErr)
 				status = nil
 			}
 		}
 
+		frequency, freqErr := api.frequencyForEntry(ctx, freqMap, baseTripID, dupMidnight, currentTime)
+		if freqErr != nil {
+			api.serverErrorResponse(w, r, freqErr)
+			return
+		}
+
 		entry := models.TripsForRouteListEntry{
-			Frequency:    nil,
+			Frequency:    frequency,
 			Schedule:     schedule,
 			Status:       status,
-			ServiceDate:  todayMidnight.UnixMilli(),
+			ServiceDate:  dupMidnight.UnixMilli(),
 			SituationIds: situations.addRefs(api.tripSituationRefs(ctx, baseTripID, tripsByID, routeAgencyMap)),
 			TripId:       utils.FormCombinedID(agencyID, dupTripID),
 		}
@@ -707,6 +786,17 @@ func tripsByBlockIDsRowToTrip(row gtfsdb.GetTripsByBlockIDsRow) gtfsdb.Trip {
 		MinArrivalTime:   row.MinArrivalTime,
 		MaxDepartureTime: row.MaxDepartureTime,
 	}
+}
+
+// tripServiceDayMidnight returns midnight of the trip's service day in the
+// agency's timezone. Overnight trips running under yesterday's (request-frame)
+// service get that date; all other trips get the request's date.
+func tripServiceDayMidnight(currentTime time.Time, trip *gtfsdb.Trip, agencyLocation *time.Location, serviceIDs, prevServiceIDs []string) time.Time {
+	serviceDate := currentTime
+	if !slices.Contains(serviceIDs, trip.ServiceID) && slices.Contains(prevServiceIDs, trip.ServiceID) {
+		serviceDate = currentTime.AddDate(0, 0, -1)
+	}
+	return time.Date(serviceDate.Year(), serviceDate.Month(), serviceDate.Day(), 0, 0, 0, 0, agencyLocation)
 }
 
 func collectStopIDsFromSchedule(schedule *models.TripsSchedule, stopIDsMap map[string]string) {
@@ -973,6 +1063,42 @@ func newTripReference(trip gtfsdb.Trip) models.Trip {
 		BlockID:       trip.BlockID.String,
 		ShapeID:       trip.ShapeID.String,
 	}
+}
+
+// resolveDuplicatedBaseTrip finds the static trip a DUPLICATED real-time trip
+// is a run of, returning the ID to use for schedule and status lookups together
+// with the trip row itself.
+//
+// The full ID is tried first, then the ID with a trailing numeric suffix
+// stripped, which is how some feeds distinguish duplicated runs. The stripped
+// ID is adopted only once it resolves: handing on an ID that matches no trip is
+// worse than keeping the unresolvable one the feed sent. When neither resolves,
+// the trip comes back zeroed, which the service date resolver reports as the
+// query day.
+func (api *RestAPI) resolveDuplicatedBaseTrip(ctx context.Context, dupTripID string) (string, gtfsdb.Trip) {
+	trip, err := api.GtfsManager.GtfsDB.Queries.GetTrip(ctx, dupTripID)
+	if err == nil {
+		return dupTripID, trip
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		api.Logger.Warn("trips-for-route: failed to resolve DUPLICATED trip ID",
+			"dup_trip_id", dupTripID, "error", err)
+	}
+
+	stripped := stripNumericSuffix(dupTripID)
+	if stripped == dupTripID {
+		return dupTripID, gtfsdb.Trip{}
+	}
+
+	strippedTrip, strippedErr := api.GtfsManager.GtfsDB.Queries.GetTrip(ctx, stripped)
+	if strippedErr != nil {
+		if !errors.Is(strippedErr, sql.ErrNoRows) {
+			api.Logger.Warn("trips-for-route: failed to resolve stripped DUPLICATED trip ID",
+				"dup_trip_id", dupTripID, "stripped_trip_id", stripped, "error", strippedErr)
+		}
+		return dupTripID, gtfsdb.Trip{}
+	}
+	return stripped, strippedTrip
 }
 
 // stripNumericSuffix removes a trailing ".<digits>" from a trip ID.

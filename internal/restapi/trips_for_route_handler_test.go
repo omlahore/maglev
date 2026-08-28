@@ -207,6 +207,70 @@ func overnightInterlineFiles() map[string]string {
 	}
 }
 
+// crossAgencyInterlineFiles models an interlined block whose active trip
+// belongs to a second agency in a different timezone: at 00:30 UTC on
+// 2025-06-13 (17:30 PDT on 2025-06-12), the active trip tfr-xb runs under
+// yesterday's service in America/Los_Angeles while the queried-route trip
+// tfr-xa runs under today's service in UTC.
+func crossAgencyInterlineFiles() map[string]string {
+	return map[string]string{
+		"agency.txt": "agency_id,agency_name,agency_url,agency_timezone\n" +
+			tripsForRouteAgencyID + ",Test Agency,http://example.com,UTC\n" +
+			"tfr-agency-b,Other Agency,http://example.com,America/Los_Angeles\n",
+		"routes.txt": "route_id,agency_id,route_short_name,route_long_name,route_type\n" +
+			tripsForRouteRouteID + "," + tripsForRouteAgencyID + ",TR,Test Route,3\n" +
+			"tfr-route-otr,tfr-agency-b,OR,Other Route,3\n",
+		"calendar.txt": "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n" +
+			"tfr-svc-yest,0,0,0,1,0,0,0,20250612,20250612\n" +
+			"tfr-svc-today,0,0,0,0,1,0,0,20250613,20250613\n",
+		"stops.txt": "stop_id,stop_name,stop_lat,stop_lon\n" +
+			tripsForRouteStop1ID + ",Stop One,37.7749,-122.4194\n" +
+			tripsForRouteStop2ID + ",Stop Two,37.7849,-122.4094\n",
+		"trips.txt": "route_id,service_id,trip_id,trip_headsign,direction_id,block_id\n" +
+			tripsForRouteRouteID + ",tfr-svc-today,tfr-xa,Headsign A,0,tfr-xblock\n" +
+			"tfr-route-otr,tfr-svc-yest,tfr-xb,Headsign B,0,tfr-xblock\n",
+		"stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n" +
+			"tfr-xa,00:05:00,00:05:00," + tripsForRouteStop1ID + ",1\n" +
+			"tfr-xa,00:25:00,00:25:00," + tripsForRouteStop2ID + ",2\n" +
+			"tfr-xb,24:00:00,24:00:00," + tripsForRouteStop1ID + ",1\n" +
+			"tfr-xb,25:00:00,25:00:00," + tripsForRouteStop2ID + ",2\n",
+	}
+}
+
+// TestTripsForRouteHandler_CrossAgencyInterlinedBlock verifies that an entry
+// whose active trip belongs to a different agency in another timezone uses
+// the per-agency service day: the entry's serviceDate and schedule timezone
+// follow the queried-route trip's agency (UTC, 2025-06-13), while the
+// status's serviceDate follows the active trip's agency (America/Los_Angeles,
+// 2025-06-12).
+func TestTripsForRouteHandler_CrossAgencyInterlinedBlock(t *testing.T) {
+	api := createTestApiWithGTFSFixture(t, clock.NewMockClock(afterMidnightClock),
+		"trips-for-route-cross-agency.zip", crossAgencyInterlineFiles())
+	combinedRouteID := utils.FormCombinedID(tripsForRouteAgencyID, tripsForRouteRouteID)
+	timeMs := afterMidnightClock.UnixMilli()
+	url := fmt.Sprintf("/api/where/trips-for-route/%s.json?key=TEST&includeSchedule=true&includeStatus=true&time=%d",
+		combinedRouteID, timeMs)
+
+	resp, model := callAPIHandler[TripsForRouteResponse](t, api, url)
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, http.StatusOK, model.Code)
+	require.Len(t, model.Data.List, 1)
+
+	entry := model.Data.List[0]
+	expectedTripID := utils.FormCombinedID(tripsForRouteAgencyID, "tfr-xa")
+	assert.Equal(t, expectedTripID, entry.TripId)
+	require.NotNil(t, entry.Schedule)
+	assert.Equal(t, "UTC", entry.Schedule.TimeZone)
+	assert.Equal(t, time.Date(2025, 6, 13, 0, 0, 0, 0, time.UTC).UnixMilli(), entry.ServiceDate)
+	require.NotNil(t, entry.Status)
+	expectedActiveTripID := utils.FormCombinedID("tfr-agency-b", "tfr-xb")
+	assert.Equal(t, expectedActiveTripID, entry.Status.ActiveTripID)
+	laLoc, err := time.LoadLocation("America/Los_Angeles")
+	require.NoError(t, err)
+	assert.Equal(t, time.Date(2025, 6, 12, 0, 0, 0, 0, laLoc).UnixMilli(), entry.Status.ServiceDate.UnixMilli())
+}
+
 func loopingRouteFiles() map[string]string {
 	return map[string]string{
 		"agency.txt": "agency_id,agency_name,agency_url,agency_timezone\n" +
@@ -483,6 +547,72 @@ func TestTripsForRouteHandler_DifferentRoutes(t *testing.T) {
 			assert.Equal(t, expectedStopIDs, actualStopIDs, "reference stop IDs must exactly match the deduped schedule stop IDs")
 		})
 	}
+}
+
+// TestTripsForRouteWithFrequency verifies active trips in the list carry
+// their frequency window (both exact_times variants), on the entry and on the
+// schedule, while non-frequency trips leave the field null.
+func TestTripsForRouteWithFrequency(t *testing.T) {
+	api := createTestApiWithFrequencyData(t)
+	defer api.Shutdown()
+
+	combinedRouteID := utils.FormCombinedID(freqAgencyID, freqRouteID)
+
+	// Query at 06:05 UTC: active window [05:35, 06:15] surfaces exactly the
+	// two frequency trips (06:00-06:10 and 06:00-06:15); freq-normal-trip
+	// departs 08:00 and is outside the window.
+	url := fmt.Sprintf("/api/where/trips-for-route/%s.json?key=TEST&includeSchedule=true&time=%d",
+		combinedRouteID, time.Date(2025, 6, 12, 6, 5, 0, 0, time.UTC).UnixMilli())
+	resp, model := callAPIHandler[TripsForRouteResponse](t, api, url)
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, http.StatusOK, model.Code)
+	require.Len(t, model.Data.List, 2, "window [05:35, 06:15] should surface exactly the two frequency trips")
+
+	for _, entry := range model.Data.List {
+		_, entryTripID, err := utils.ExtractAgencyIDAndCodeID(entry.TripId)
+		require.NoError(t, err)
+
+		require.NotNil(t, entry.Frequency, "frequency trip %q must carry frequency data", entryTripID)
+
+		exactTimes := 0
+		headway := 600 * time.Second
+		if entryTripID == freqExactTripID {
+			exactTimes = 1
+			headway = 1800 * time.Second
+		}
+		assert.Equal(t, exactTimes, entry.Frequency.ExactTimes)
+		assert.Equal(t, headway, entry.Frequency.Headway.Duration)
+
+		// Fixture windows span 06:00-09:00 UTC on the 2025-06-12 service date;
+		// compare instants (millis) because ModelTime round-trips in time.Local.
+		assert.Equal(t, time.Date(2025, 6, 12, 6, 0, 0, 0, time.UTC).UnixMilli(), entry.Frequency.StartTime.UnixMilli())
+		assert.Equal(t, time.Date(2025, 6, 12, 9, 0, 0, 0, time.UTC).UnixMilli(), entry.Frequency.EndTime.UnixMilli())
+
+		require.NotNil(t, entry.Schedule, "schedule should be present when includeSchedule=true")
+		require.NotNil(t, entry.Schedule.Frequency, "schedule for frequency trip %q must carry frequency data", entryTripID)
+		assert.Equal(t, entry.Frequency.StartTime.UnixMilli(), entry.Schedule.Frequency.StartTime.UnixMilli())
+		assert.Equal(t, entry.Frequency.EndTime.UnixMilli(), entry.Schedule.Frequency.EndTime.UnixMilli())
+	}
+
+	// Query at 08:05 UTC: active window [07:35, 08:15] surfaces only
+	// freq-normal-trip, which must keep frequency null on both entry and
+	// schedule.
+	url = fmt.Sprintf("/api/where/trips-for-route/%s.json?key=TEST&includeSchedule=true&time=%d",
+		combinedRouteID, time.Date(2025, 6, 12, 8, 5, 0, 0, time.UTC).UnixMilli())
+	resp, model = callAPIHandler[TripsForRouteResponse](t, api, url)
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, http.StatusOK, model.Code)
+	require.Len(t, model.Data.List, 1, "window [07:35, 08:15] should surface only freq-normal-trip")
+
+	entry := model.Data.List[0]
+	_, entryTripID, err := utils.ExtractAgencyIDAndCodeID(entry.TripId)
+	require.NoError(t, err)
+	assert.Equal(t, freqNormalTripD, entryTripID)
+	assert.Nil(t, entry.Frequency, "non-frequency trip must not carry frequency data")
+	require.NotNil(t, entry.Schedule)
+	assert.Nil(t, entry.Schedule.Frequency, "schedule for non-frequency trip must not carry frequency data")
 }
 
 // TestTripsForRouteHandler_TimeOmitted verifies that omitting the time parameter
@@ -1086,9 +1216,14 @@ func TestTripsForRouteHandler_OvernightInterlinedBlock(t *testing.T) {
 	entry := model.Data.List[0]
 	expectedTripID := utils.FormCombinedID(tripsForRouteAgencyID, "tfr-yest-a")
 	assert.Equal(t, expectedTripID, entry.TripId)
+	// Yesterday's trips belong to the previous service day, so the service
+	// date must be 2025-06-12, not today's.
+	expectedServiceDate := time.Date(2025, 6, 12, 0, 0, 0, 0, time.UTC).UnixMilli()
+	assert.Equal(t, expectedServiceDate, entry.ServiceDate)
 	require.NotNil(t, entry.Status)
 	expectedActiveTripID := utils.FormCombinedID(tripsForRouteAgencyID, "tfr-yest-b")
 	assert.Equal(t, expectedActiveTripID, entry.Status.ActiveTripID)
+	assert.Equal(t, expectedServiceDate, entry.Status.ServiceDate.UnixMilli())
 }
 
 // TestTripsForRouteHandler_LoopingRouteBlock verifies that when a block visits
@@ -1262,7 +1397,7 @@ func TestTripsForRouteHandler_SituationReferences(t *testing.T) {
 	// handler's window explicitly. Midday Pacific on a weekday inside the RABA
 	// fixture's calendar range, when its trips are running.
 	queryTime := time.Date(2025, 6, 12, 19, 0, 0, 0, time.UTC)
-	url := fmt.Sprintf("/api/where/trips-for-route/25_151.json?key=TEST&includeSchedule=true&time=%d",
+	url := fmt.Sprintf("/api/where/trips-for-route/25_151.json?key=TEST&includeSchedule=true&includeStatus=true&time=%d",
 		queryTime.UnixMilli())
 
 	resp, model := callAPIHandler[TripsForRouteResponse](t, api, url)
@@ -1286,6 +1421,74 @@ func TestTripsForRouteHandler_SituationReferences(t *testing.T) {
 	// the handler resolved the route under.
 	require.Contains(t, emitted, "25_test-alert-trips-for-route",
 		"expected the seeded alert to surface as a situationId")
+
+	// The resolved date is handed to BuildTripStatus as well as stamped on the
+	// entry, so the two must never disagree.
+	for _, entry := range model.Data.List {
+		if entry.Status == nil {
+			continue
+		}
+		assert.Equal(t, entry.ServiceDate, entry.Status.ServiceDate.UnixMilli(),
+			"entry %q reports a different serviceDate than its status", entry.TripId)
+	}
+}
+
+// TestResolveDuplicatedBaseTrip covers the IDs a DUPLICATED real-time trip can
+// arrive under, including the one that used to hand a nonexistent trip ID to
+// the schedule and status builders.
+func TestResolveDuplicatedBaseTrip(t *testing.T) {
+	api := createTestApi(t)
+	ctx := context.Background()
+
+	trips, err := api.GtfsManager.GtfsDB.Queries.ListTrips(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, trips, "fixture must contain trips")
+	staticTripID := trips[0].ID
+
+	tests := []struct {
+		name        string
+		dupTripID   string
+		wantTripID  string
+		wantMatched bool
+	}{
+		{
+			name:        "Feed reuses the static trip ID",
+			dupTripID:   staticTripID,
+			wantTripID:  staticTripID,
+			wantMatched: true,
+		},
+		{
+			name:        "Feed appends a numeric suffix to the static trip ID",
+			dupTripID:   staticTripID + ".00060",
+			wantTripID:  staticTripID,
+			wantMatched: true,
+		},
+		{
+			name:        "Neither the suffixed nor the stripped ID resolves",
+			dupTripID:   "no-such-trip.00060",
+			wantTripID:  "no-such-trip.00060",
+			wantMatched: false,
+		},
+		{
+			name:        "Synthetic ID with nothing to strip",
+			dupTripID:   "no-such-trip",
+			wantTripID:  "no-such-trip",
+			wantMatched: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			baseTripID, baseTrip := api.resolveDuplicatedBaseTrip(ctx, tt.dupTripID)
+
+			assert.Equal(t, tt.wantTripID, baseTripID)
+			if tt.wantMatched {
+				assert.Equal(t, tt.wantTripID, baseTrip.ID, "the returned trip must be the one the ID names")
+			} else {
+				assert.Empty(t, baseTrip.ID, "an unresolved trip must come back zeroed")
+			}
+		})
+	}
 }
 
 // TestTripsForRouteHandler_BlockSequence_AdjacentTripReferences verifies that
