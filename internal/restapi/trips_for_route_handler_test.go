@@ -270,13 +270,13 @@ func TestTripsForRouteHandler_CrossAgencyInterlinedBlock(t *testing.T) {
 	assert.Equal(t, expectedTripID, entry.TripId)
 	require.NotNil(t, entry.Schedule)
 	assert.Equal(t, "UTC", entry.Schedule.TimeZone)
-	// Without per-agency timezone resolution, the past-midnight trip uses
-	// prevDayMidnight (June 12 UTC) for both the entry and the status.
-	assert.Equal(t, time.Date(2025, 6, 12, 0, 0, 0, 0, time.UTC).UnixMilli(), entry.ServiceDate)
+	assert.Equal(t, time.Date(2025, 6, 13, 0, 0, 0, 0, time.UTC).UnixMilli(), entry.ServiceDate)
 	require.NotNil(t, entry.Status)
 	expectedActiveTripID := utils.FormCombinedID("tfr-agency-b", "tfr-xb")
 	assert.Equal(t, expectedActiveTripID, entry.Status.ActiveTripID)
-	assert.Equal(t, time.Date(2025, 6, 12, 0, 0, 0, 0, time.UTC).UnixMilli(), entry.Status.ServiceDate.UnixMilli())
+	laLoc, err := time.LoadLocation("America/Los_Angeles")
+	require.NoError(t, err)
+	assert.Equal(t, time.Date(2025, 6, 12, 0, 0, 0, 0, laLoc).UnixMilli(), entry.Status.ServiceDate.UnixMilli())
 }
 
 func loopingRouteFiles() map[string]string {
